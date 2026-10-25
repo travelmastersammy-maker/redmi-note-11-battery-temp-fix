@@ -1,0 +1,178 @@
+diff --git a/drivers/power/supply/maxim/max77729_charger.c b/drivers/power/supply/maxim/max77729_charger.c
+index 6614d0366..c4af65efd 100644
+--- a/drivers/power/supply/maxim/max77729_charger.c
++++ b/drivers/power/supply/maxim/max77729_charger.c
+@@ -7,6 +7,7 @@
+  * published by the Free Software Foundation.
+  */
+ #define pr_fmt(fmt)	"[MAX77729-chg] %s: " fmt, __func__
++#define MAX77729_FG_TEMP_INVALID	(-32768)
+ #define DEBUG
+ 
+ #include <linux/mfd/max77729-private.h>
+@@ -160,7 +161,8 @@ static int max77729_set_fast_charge_mode(struct max77729_charger_data *charger,
+ {
+ 	int rc = 0;
+ 	union power_supply_propval prop ={0, };
+-	int batt_verify = 0, batt_soc = 0, batt_temp = 0;
++	int batt_verify = 0, batt_soc = 0, batt_temp = 0, batt_temp_raw = -1;
++	int batt_temp_raw_rc = -ENODATA;
+ 
+ 	if(!charger->psy_bms)
+ 		charger->psy_bms = power_supply_get_by_name("bms");
+@@ -182,13 +184,21 @@ static int max77729_set_fast_charge_mode(struct max77729_charger_data *charger,
+ 			pr_err("%s : get battery temp fail\n", __func__);
+ 		}
+ 		batt_temp = prop.intval;
++
++		prop.intval = -1;
++		batt_temp_raw_rc = power_supply_get_property(charger->psy_bms,
++							     POWER_SUPPLY_PROP_TEMP_AMBIENT,
++							     &prop);
++		batt_temp_raw = prop.intval;
+ 	}
+ 	/*If TA plug in with PPS, battery auth success and soc less than 95%, FFC flag will enabled.
+ 		The temp is normal set fastcharge mode as 1 and jeita loop also handle fastcharge prop*/
+ 	//pr_err("%s: batt_verify: %d, batt_soc: %d, batt_temp: %d",__func__, batt_verify, batt_soc, batt_temp);
+ 	if ((pd_active == 2) && batt_verify && batt_soc < 95){
+ 		g_ffc_disable = false;
+-		if(batt_temp >= 150 && batt_temp <= 480){
++		if(batt_temp_raw_rc >= 0 && batt_temp_raw != -295 &&
++		   batt_temp_raw != MAX77729_FG_TEMP_INVALID &&
++		   batt_temp >= 150 && batt_temp <= 480){
+ 			prop.intval = 1;
+ 		}else{
+ 			prop.intval = 0;
+@@ -3409,7 +3419,11 @@ static void max77729_period_work(struct work_struct *work)
+ 		container_of(work, struct max77729_charger_data, period_work.work);
+ 	static int wdt_count = 0;
+ 	static int notify_count = 0;
+-	int batt_curr = 0, batt_volt = 0, batt_ocv = 0, batt_temp=0, fast_mode = 0, batt_soc, raw_soc, batt_id = 1;
++	static bool temp_fault_soc_limited;
++	int batt_curr = 0, batt_volt = 0, batt_ocv = 0, batt_temp=0, fast_mode = 0, batt_soc = 0, raw_soc, batt_id = 1;
++	int batt_temp_raw = -1, temp_read_rc = -ENODATA, temp_raw_read_rc = -ENODATA;
++	int soc_read_rc = -ENODATA;
++	bool batt_temp_fault = true;
+ 	union power_supply_propval pval ={0, };
+ 	u8 reg_data;
+ 	int rc = 0;
+@@ -3454,14 +3468,25 @@ static void max77729_period_work(struct work_struct *work)
+ 		}
+ 		fast_mode = pval.intval;
+ 
+-		rc = power_supply_get_property(charger->psy_bms, POWER_SUPPLY_PROP_TEMP, &pval);
+-		if (rc < 0) {
++		temp_read_rc = power_supply_get_property(charger->psy_bms,
++							 POWER_SUPPLY_PROP_TEMP, &pval);
++		if (temp_read_rc < 0) {
+ 			pr_err("%s : get POWER_SUPPLY_PROP_FASTCHARGE_MODE fail\n", __func__);
+ 		}
+ 		batt_temp = pval.intval;
+ 
++		pval.intval = -1;
++		temp_raw_read_rc = power_supply_get_property(charger->psy_bms,
++							     POWER_SUPPLY_PROP_TEMP_AMBIENT,
++							     &pval);
++		batt_temp_raw = pval.intval;
++		batt_temp_fault = temp_read_rc < 0 || temp_raw_read_rc < 0 ||
++			batt_temp_raw == -295 ||
++			batt_temp_raw == MAX77729_FG_TEMP_INVALID;
++
+ 		pval.intval = 0;
+-		rc = power_supply_get_property(charger->psy_bms, POWER_SUPPLY_PROP_CAPACITY, &pval);
++		soc_read_rc = power_supply_get_property(charger->psy_bms,
++							POWER_SUPPLY_PROP_CAPACITY, &pval);
+ 		batt_soc = pval.intval;
+ 
+ 		/* pval.intval = SEC_FUELGAUGE_CAPACITY_TYPE_RAW; */
+@@ -3477,6 +3502,25 @@ static void max77729_period_work(struct work_struct *work)
+ 
+ 		psy_do_property("battery", get, POWER_SUPPLY_PROP_BATTERY_CHARGING_ENABLED, pval);
+ 
++		if (!batt_temp_fault) {
++			temp_fault_soc_limited = false;
++		} else if (soc_read_rc < 0 || raw_soc < 0 || raw_soc >= 800) {
++			temp_fault_soc_limited = true;
++		} else if (raw_soc <= 780) {
++			temp_fault_soc_limited = false;
++		}
++		if (charger->mainfcc_votable)
++			vote(charger->mainfcc_votable, "FG_TEMP_FAULT", batt_temp_fault,
++			     500);
++		if (charger->chgctrl_votable)
++			vote(charger->chgctrl_votable, "FG_TEMP_FAULT",
++			     batt_temp_fault && temp_fault_soc_limited,
++			     SEC_BAT_CHG_MODE_CHARGING_OFF);
++		if (batt_temp_fault)
++			pr_warn_ratelimited("%s: battery temperature unavailable (raw=%d, temp_rc=%d, raw_rc=%d, soc=%d, soc_rc=%d); limiting charge to 500 mA and 80%%\n",
++					    __func__, batt_temp_raw, temp_read_rc,
++					    temp_raw_read_rc, batt_soc, soc_read_rc);
++
+ 		if (batt_id == BATTERY_VENDOR_UNKNOWN){
+ 			schedule_delayed_work(&charger->period_work, msecs_to_jiffies(10000));
+ 			schedule_delayed_work(&charger->batt_notify_work, msecs_to_jiffies(11000));
+@@ -3579,9 +3623,16 @@ static void max77729_period_work(struct work_struct *work)
+ 				/* max77729_write_reg(charger->i2c, 0xB8, 0xD8); */
+ 			}
+ 		}
++	} else {
++		if (charger->mainfcc_votable)
++			vote(charger->mainfcc_votable, "FG_TEMP_FAULT", false, 0);
++		if (charger->chgctrl_votable)
++			vote(charger->chgctrl_votable, "FG_TEMP_FAULT", true,
++			     SEC_BAT_CHG_MODE_CHARGING_OFF);
++		pr_warn_ratelimited("%s: BMS unavailable; charging disabled until battery telemetry returns\n",
++				     __func__);
+ 	}
+ 
+-
+ 	if(wdt_count++ > 10){
+ 		wdt_count = 0;
+ 		/* max77729_chg_set_wdtmr_kick(charger); */
+diff --git a/drivers/power/supply/maxim/max77729_fuelgauge.c b/drivers/power/supply/maxim/max77729_fuelgauge.c
+index 07ab0dd49..a84563b6a 100644
+--- a/drivers/power/supply/maxim/max77729_fuelgauge.c
++++ b/drivers/power/supply/maxim/max77729_fuelgauge.c
+@@ -8,6 +8,7 @@
+  * published by the Free Software Foundation.
+  */
+ #define pr_fmt(fmt)	"[MAX77729-fg] %s: " fmt, __func__
++#define MAX77729_FG_TEMP_INVALID	(-32768)
+ 
+ #define DEBUG
+ /* #define BATTERY_LOG_MESSAGE */
+@@ -492,7 +493,7 @@ static int max77729_fg_read_temp(struct max77729_fuelgauge_data *fuelgauge)
+ 	if (max77729_fg_check_battery_present(fuelgauge)) {
+ 		if (max77729_bulk_read(fuelgauge->i2c, TEMPERATURE_REG, 2, data) < 0) {
+ 			pr_err("%s: Failed to read TEMPERATURE_REG\n", __func__);
+-			return -1;
++			return MAX77729_FG_TEMP_INVALID;
+ 		}
+ 
+ 		pr_info("%s: raw temperature registers data[1]=0x%02x data[0]=0x%02x\n",
+@@ -2206,13 +2207,24 @@ static int max77729_fg_get_property(struct power_supply *psy,
+ 		break;
+ 	case POWER_SUPPLY_PROP_TEMP_AMBIENT:
+ 		val->intval = max77729_get_fuelgauge_value(fuelgauge, FG_TEMPERATURE);
++		if (val->intval == -295 ||
++		    val->intval == MAX77729_FG_TEMP_INVALID) {
++			pr_warn_ratelimited("%s: invalid raw temperature reading %d\n",
++					     __func__, val->intval);
++		}
+ 		break;
+ 	case POWER_SUPPLY_PROP_TEMP:
+-		if (fuelgauge->fake_temp == -EINVAL){
++		if (fuelgauge->fake_temp == -EINVAL) {
+ 			val->intval = max77729_get_fuelgauge_value(fuelgauge, FG_TEMPERATURE);
+ 		} else {
+ 			val->intval = fuelgauge->fake_temp;
+ 		}
++		if (val->intval == -295 ||
++		    val->intval == MAX77729_FG_TEMP_INVALID) {
++			pr_warn_ratelimited("%s: invalid temperature reading %d; using degraded charging policy\n",
++					     __func__, val->intval);
++			val->intval = 250;
++		}
+ 		break;
+ 
+ 	case POWER_SUPPLY_PROP_ENERGY_FULL:
